@@ -1,0 +1,19 @@
+# DP: Fix PR debug/53135 (ice on valid).
+
+2012-10-03  Alexandre Oliva <aoliva@redhat.com>
+
+	PR debug/53135
+	* dwarf2out.c (value_format): Use block4 for dw_val_class_loc
+	when needed.
+
+--- a/src/gcc/dwarf2out.c	(revision 192020)
++++ b/src/gcc/dwarf2out.c	(revision 192021)
+@@ -8012,6 +8012,8 @@
+ 	  return DW_FORM_block1;
+ 	case 2:
+ 	  return DW_FORM_block2;
++	case 4:
++	  return DW_FORM_block4;
+ 	default:
+ 	  gcc_unreachable ();
+ 	}

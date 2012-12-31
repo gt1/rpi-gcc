@@ -1,0 +1,44 @@
+# DP: PR c/54552
+
+gcc/
+
+2012-09-20  Joseph Myers  <joseph@codesourcery.com>
+
+	PR c/54552
+	* c-typeck.c (c_cast_expr): When casting to a type requiring
+	C_MAYBE_CONST_EXPR to be created, pass the inner expression to
+	c_fully_fold first.
+
+gcc/testsuite/
+
+2012-09-20  Joseph Myers  <joseph@codesourcery.com>
+
+	PR c/54552
+	* gcc.c-torture/compile/pr54552-1.c: New test.
+
+--- a/src/gcc/testsuite/gcc.c-torture/compile/pr54552-1.c	(revision 0)
++++ b/src/gcc/testsuite/gcc.c-torture/compile/pr54552-1.c	(revision 191591)
+@@ -0,0 +1,8 @@
++void
++f (void)
++{
++  unsigned n = 10;
++
++  typedef double T[n];
++  (double (*)[n])((unsigned char (*)[sizeof (T)]){ 0 });
++}
+--- a/src/gcc/c-typeck.c	(revision 191590)
++++ b/src/gcc/c-typeck.c	(revision 191591)
+@@ -4868,8 +4868,11 @@
+   ret = build_c_cast (loc, type, expr);
+   if (type_expr)
+     {
++      bool inner_expr_const = true;
++      ret = c_fully_fold (ret, require_constant_value, &inner_expr_const);
+       ret = build2 (C_MAYBE_CONST_EXPR, TREE_TYPE (ret), type_expr, ret);
+-      C_MAYBE_CONST_EXPR_NON_CONST (ret) = !type_expr_const;
++      C_MAYBE_CONST_EXPR_NON_CONST (ret) = !(type_expr_const
++					     && inner_expr_const);
+       SET_EXPR_LOCATION (ret, loc);
+     }
+ 

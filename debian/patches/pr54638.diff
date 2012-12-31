@@ -1,0 +1,33 @@
+# DP: Fix PR middle-end/54638
+
+gcc/
+
+2012-09-21  Richard Guenther  <rguenther@suse.de>
+
+	PR middle-end/54638
+	Backport from mainline
+	2012-04-19  Richard Guenther  <rguenther@suse.de>
+
+	* ira-int.h (ira_allocno_object_iter_cond): Avoid out-of-bound
+	array access.
+
+Index: gcc/ira-int.h
+===================================================================
+--- a/src/gcc/ira-int.h	(revision 191604)
++++ b/src/gcc/ira-int.h	(revision 191605)
+@@ -1138,8 +1138,13 @@
+ ira_allocno_object_iter_cond (ira_allocno_object_iterator *i, ira_allocno_t a,
+ 			      ira_object_t *o)
+ {
+-  *o = ALLOCNO_OBJECT (a, i->n);
+-  return i->n++ < ALLOCNO_NUM_OBJECTS (a);
++  int n = i->n++;
++  if (n < ALLOCNO_NUM_OBJECTS (a))
++    {
++      *o = ALLOCNO_OBJECT (a, n);
++      return true;
++    }
++  return false;
+ }
+ 
+ /* Loop over all objects associated with allocno A.  In each

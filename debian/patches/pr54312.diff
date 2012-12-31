@@ -1,0 +1,36 @@
+# DP: Fix PR lto/54312
+
+gcc/lto/
+
+2012-09-20  Richard Guenther  <rguenther@suse.de>
+
+	Backport from mainline
+	2012-09-11  Jan Hubicka  <jh@suse.cz>
+
+	PR lto/54312
+	* lto.c (uniquify_nodes): Remove quadratic loop checking if the
+	type is variant leader.
+
+--- a/src/gcc/lto/lto.c	(revision 191567)
++++ b/src/gcc/lto/lto.c	(revision 191568)
+@@ -761,6 +761,7 @@
+ 	     variant list state before fixup is broken.  */
+ 	  tree tem, mv;
+ 
++#ifdef ENABLE_CHECKING
+ 	  /* Remove us from our main variant list if we are not the
+ 	     variant leader.  */
+ 	  if (TYPE_MAIN_VARIANT (t) != t)
+@@ -768,10 +769,9 @@
+ 	      tem = TYPE_MAIN_VARIANT (t);
+ 	      while (tem && TYPE_NEXT_VARIANT (tem) != t)
+ 		tem = TYPE_NEXT_VARIANT (tem);
+-	      if (tem)
+-		TYPE_NEXT_VARIANT (tem) = TYPE_NEXT_VARIANT (t);
+-	      TYPE_NEXT_VARIANT (t) = NULL_TREE;
++	      gcc_assert (!tem && !TYPE_NEXT_VARIANT (t));
+ 	    }
++#endif
+ 
+ 	  /* Query our new main variant.  */
+ 	  mv = GIMPLE_REGISTER_TYPE (TYPE_MAIN_VARIANT (t));

@@ -1,0 +1,156 @@
+# DP: Fix PR c/54103
+
+gcc/
+
+2012-09-20  Joseph Myers  <joseph@codesourcery.com>
+
+	PR c/54103
+	* c-typeck.c (build_unary_op): Pass original argument of
+	TRUTH_NOT_EXPR to c_objc_common_truthvalue_conversion, then remove
+	any C_MAYBE_CONST_EXPR, if it has integer operands.
+	(build_binary_op): Pass original arguments of TRUTH_ANDIF_EXPR,
+	TRUTH_ORIF_EXPR, TRUTH_AND_EXPR, TRUTH_OR_EXPR and TRUTH_XOR_EXPR
+	to c_objc_common_truthvalue_conversion, then remove any
+	C_MAYBE_CONST_EXPR, if they have integer operands.  Use
+	c_objc_common_truthvalue_conversion not
+	c_common_truthvalue_conversion.
+	(c_objc_common_truthvalue_conversion): Build NE_EXPR directly and
+	call note_integer_operands for arguments with integer operands
+	that are not integer constants.
+
+gcc/testsuite/
+
+2012-09-20  Joseph Myers  <joseph@codesourcery.com>
+
+	PR c/54103
+	* gcc.c-torture/compile/pr54103-1.c,
+	gcc.c-torture/compile/pr54103-2.c,
+	gcc.c-torture/compile/pr54103-3.c,
+	gcc.c-torture/compile/pr54103-4.c,
+	gcc.c-torture/compile/pr54103-5.c,
+	gcc.c-torture/compile/pr54103-6.c: New tests.
+	* gcc.dg/c90-const-expr-8.c: Update expected column number.
+
+--- a/src/gcc/testsuite/gcc.c-torture/compile/pr54103-2.c	(revision 0)
++++ b/src/gcc/testsuite/gcc.c-torture/compile/pr54103-2.c	(revision 191589)
+@@ -0,0 +1,5 @@
++void
++f (void)
++{
++  0 / 0 || 0 ? : 0;
++}
+--- a/src/gcc/testsuite/gcc.c-torture/compile/pr54103-4.c	(revision 0)
++++ b/src/gcc/testsuite/gcc.c-torture/compile/pr54103-4.c	(revision 191589)
+@@ -0,0 +1,5 @@
++void
++f (void)
++{
++  0 / 0 && 1 ? : 0;
++}
+--- a/src/gcc/testsuite/gcc.c-torture/compile/pr54103-6.c	(revision 0)
++++ b/src/gcc/testsuite/gcc.c-torture/compile/pr54103-6.c	(revision 191589)
+@@ -0,0 +1,5 @@
++void
++f (void)
++{
++  0 || 65536*65536 ? : 0;
++}
+--- a/src/gcc/testsuite/gcc.c-torture/compile/pr54103-1.c	(revision 0)
++++ b/src/gcc/testsuite/gcc.c-torture/compile/pr54103-1.c	(revision 191589)
+@@ -0,0 +1,5 @@
++void
++f (void)
++{
++  0 || 0 / 0 ? : 0;
++}
+--- a/src/gcc/testsuite/gcc.c-torture/compile/pr54103-3.c	(revision 0)
++++ b/src/gcc/testsuite/gcc.c-torture/compile/pr54103-3.c	(revision 191589)
+@@ -0,0 +1,5 @@
++void
++f (void)
++{
++  1 && 0 / 0 ? : 0;
++}
+--- a/src/gcc/testsuite/gcc.c-torture/compile/pr54103-5.c	(revision 0)
++++ b/src/gcc/testsuite/gcc.c-torture/compile/pr54103-5.c	(revision 191589)
+@@ -0,0 +1,5 @@
++void
++f (void)
++{
++  !(0 / 0);
++}
+--- a/src/gcc/testsuite/gcc.dg/c90-const-expr-8.c	(revision 191588)
++++ b/src/gcc/testsuite/gcc.dg/c90-const-expr-8.c	(revision 191589)
+@@ -22,6 +22,6 @@
+   E5 = 0 * -INT_MIN, /* { dg-warning "12:integer overflow in expression" } */
+   /* { dg-error "3:overflow in constant expression" "constant" { target *-*-* } 22 } */
+   E6 = 0 * !-INT_MIN, /* { dg-warning "13:integer overflow in expression" } */
+-  /* { dg-error "3:not an integer constant" "constant" { target *-*-* } 24 } */
++  /* { dg-error "8:not an integer constant" "constant" { target *-*-* } 24 } */
+   E7 = INT_MIN % -1 /* Not an overflow.  */
+ };
+--- a/src/gcc/c-typeck.c	(revision 191588)
++++ b/src/gcc/c-typeck.c	(revision 191589)
+@@ -3642,7 +3642,13 @@
+ 		    "wrong type argument to unary exclamation mark");
+ 	  return error_mark_node;
+ 	}
+-      arg = c_objc_common_truthvalue_conversion (location, arg);
++      if (int_operands)
++	{
++	  arg = c_objc_common_truthvalue_conversion (location, xarg);
++	  arg = remove_c_maybe_const_expr (arg);
++	}
++      else
++	arg = c_objc_common_truthvalue_conversion (location, arg);
+       ret = invert_truthvalue_loc (location, arg);
+       /* If the TRUTH_NOT_EXPR has been folded, reset the location.  */
+       if (EXPR_P (ret) && EXPR_HAS_LOCATION (ret))
+@@ -9896,8 +9902,20 @@
+ 	     but that does not mean the operands should be
+ 	     converted to ints!  */
+ 	  result_type = integer_type_node;
+-	  op0 = c_common_truthvalue_conversion (location, op0);
+-	  op1 = c_common_truthvalue_conversion (location, op1);
++	  if (op0_int_operands)
++	    {
++	      op0 = c_objc_common_truthvalue_conversion (location, orig_op0);
++	      op0 = remove_c_maybe_const_expr (op0);
++	    }
++	  else
++	    op0 = c_objc_common_truthvalue_conversion (location, op0);
++	  if (op1_int_operands)
++	    {
++	      op1 = c_objc_common_truthvalue_conversion (location, orig_op1);
++	      op1 = remove_c_maybe_const_expr (op1);
++	    }
++	  else
++	    op1 = c_objc_common_truthvalue_conversion (location, op1);
+ 	  converted = 1;
+ 	  boolean_op = true;
+ 	}
+@@ -10609,13 +10627,18 @@
+ 
+   int_const = (TREE_CODE (expr) == INTEGER_CST && !TREE_OVERFLOW (expr));
+   int_operands = EXPR_INT_CONST_OPERANDS (expr);
+-  if (int_operands)
+-    expr = remove_c_maybe_const_expr (expr);
++  if (int_operands && TREE_CODE (expr) != INTEGER_CST)
++    {
++      expr = remove_c_maybe_const_expr (expr);
++      expr = build2 (NE_EXPR, integer_type_node, expr,
++		     convert (TREE_TYPE (expr), integer_zero_node));
++      expr = note_integer_operands (expr);
++    }
++  else
++    /* ??? Should we also give an error for vectors rather than leaving
++       those to give errors later?  */
++    expr = c_common_truthvalue_conversion (location, expr);
+ 
+-  /* ??? Should we also give an error for vectors rather than leaving
+-     those to give errors later?  */
+-  expr = c_common_truthvalue_conversion (location, expr);
+-
+   if (TREE_CODE (expr) == INTEGER_CST && int_operands && !int_const)
+     {
+       if (TREE_OVERFLOW (expr))

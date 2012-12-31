@@ -1,0 +1,1504 @@
+# DP: Go fixes
+
+--- a/src/gcc/go/ChangeLog	(revision 191578)
++++ b/src/gcc/go/ChangeLog	(revision 192023)
+@@ -1,3 +1,7 @@
++2012-09-20  Ian Lance Taylor  <iant@google.com>
++
++	* Make-lang.in (go/gogo.o): Depend on filenames.h.
++
+ 2012-09-20  Release Manager
+ 
+ 	* GCC 4.7.2 released.
+--- a/src/gcc/go/Make-lang.in	(revision 191578)
++++ b/src/gcc/go/Make-lang.in	(revision 192023)
+@@ -289,10 +289,11 @@
+ 	convert.h output.h $(DIAGNOSTIC_H) $(GO_TYPES_H) \
+ 	$(GO_EXPRESSIONS_H) $(GO_STATEMENTS_H) $(GO_RUNTIME_H) \
+ 	go/gofrontend/backend.h $(GO_GOGO_H)
+-go/gogo.o: go/gofrontend/gogo.cc $(GO_SYSTEM_H) $(GO_C_H) \
+-	go/gofrontend/go-dump.h $(GO_LEX_H) $(GO_TYPES_H) $(GO_STATEMENTS_H) \
+-	$(GO_EXPRESSIONS_H) go/gofrontend/dataflow.h $(GO_RUNTIME_H) \
+-	$(GO_IMPORT_H) $(GO_EXPORT_H) go/gofrontend/backend.h $(GO_GOGO_H)
++go/gogo.o: go/gofrontend/gogo.cc $(GO_SYSTEM_H) \
++	$(srcdir)/../include/filenames.h $(GO_C_H) go/gofrontend/go-dump.h \
++	$(GO_LEX_H) $(GO_TYPES_H) $(GO_STATEMENTS_H) $(GO_EXPRESSIONS_H) \
++	go/gofrontend/dataflow.h $(GO_RUNTIME_H) $(GO_IMPORT_H) \
++	$(GO_EXPORT_H) go/gofrontend/backend.h $(GO_GOGO_H)
+ go/import.o: go/gofrontend/import.cc $(GO_SYSTEM_H) \
+ 	$(srcdir)/../include/filenames.h $(srcdir)/../include/simple-object.h \
+ 	$(GO_C_H) $(GO_GOGO_H) $(GO_LEX_H) $(GO_TYPES_H) $(GO_EXPORT_H) \
+--- a/src/gcc/go/gofrontend/gogo.cc	(revision 191578)
++++ b/src/gcc/go/gofrontend/gogo.cc	(revision 192023)
+@@ -6,6 +6,8 @@
+ 
+ #include "go-system.h"
+ 
++#include "filenames.h"
++
+ #include "go-c.h"
+ #include "go-dump.h"
+ #include "lex.h"
+@@ -385,6 +387,57 @@
+ 		     bool is_local_name_exported,
+ 		     Location location)
+ {
++  if (filename.empty())
++    {
++      error_at(location, "import path is empty");
++      return;
++    }
++
++  const char *pf = filename.data();
++  const char *pend = pf + filename.length();
++  while (pf < pend)
++    {
++      unsigned int c;
++      int adv = Lex::fetch_char(pf, &c);
++      if (adv == 0)
++	{
++	  error_at(location, "import path contains invalid UTF-8 sequence");
++	  return;
++	}
++      if (c == '\0')
++	{
++	  error_at(location, "import path contains NUL");
++	  return;
++	}
++      if (c < 0x20 || c == 0x7f)
++	{
++	  error_at(location, "import path contains control character");
++	  return;
++	}
++      if (c == '\\')
++	{
++	  error_at(location, "import path contains backslash; use slash");
++	  return;
++	}
++      if (Lex::is_unicode_space(c))
++	{
++	  error_at(location, "import path contains space character");
++	  return;
++	}
++      if (c < 0x7f && strchr("!\"#$%&'()*,:;<=>?[]^`{|}", c) != NULL)
++	{
++	  error_at(location, "import path contains invalid character '%c'", c);
++	  return;
++	}
++      pf += adv;
++    }
++
++  if (IS_ABSOLUTE_PATH(filename.c_str()))
++    {
++      error_at(location, "import path cannot be absolute path");
++      return;
++    }
++
+   if (filename == "unsafe")
+     {
+       this->import_unsafe(local_name, is_local_name_exported, location);
+@@ -1003,7 +1056,15 @@
+   Named_object* no = this->current_bindings()->add_type(name, NULL, type,
+ 							location);
+   if (!this->in_global_scope() && no->is_type())
+-    no->type_value()->set_in_function(this->functions_.back().function);
++    {
++      Named_object* f = this->functions_.back().function;
++      unsigned int index;
++      if (f->is_function())
++	index = f->func_value()->new_local_type_index();
++      else
++	index = 0;
++      no->type_value()->set_in_function(f, index);
++    }
+ }
+ 
+ // Add a named type.
+@@ -1025,7 +1086,12 @@
+   if (!this->in_global_scope() && no->is_type_declaration())
+     {
+       Named_object* f = this->functions_.back().function;
+-      no->type_declaration_value()->set_in_function(f);
++      unsigned int index;
++      if (f->is_function())
++	index = f->func_value()->new_local_type_index();
++      else
++	index = 0;
++      no->type_declaration_value()->set_in_function(f, index);
+     }
+   return no;
+ }
+@@ -2806,7 +2872,8 @@
+ Build_method_tables::type(Type* type)
+ {
+   Named_type* nt = type->named_type();
+-  if (nt != NULL)
++  Struct_type* st = type->struct_type();
++  if (nt != NULL || st != NULL)
+     {
+       for (std::vector<Interface_type*>::const_iterator p =
+ 	     this->interfaces_.begin();
+@@ -2816,11 +2883,24 @@
+ 	  // We ask whether a pointer to the named type implements the
+ 	  // interface, because a pointer can implement more methods
+ 	  // than a value.
+-	  if ((*p)->implements_interface(Type::make_pointer_type(nt), NULL))
++	  if (nt != NULL)
+ 	    {
+-	      nt->interface_method_table(this->gogo_, *p, false);
+-	      nt->interface_method_table(this->gogo_, *p, true);
++	      if ((*p)->implements_interface(Type::make_pointer_type(nt),
++					     NULL))
++		{
++		  nt->interface_method_table(this->gogo_, *p, false);
++		  nt->interface_method_table(this->gogo_, *p, true);
++		}
+ 	    }
++	  else
++	    {
++	      if ((*p)->implements_interface(Type::make_pointer_type(st),
++					     NULL))
++		{
++		  st->interface_method_table(this->gogo_, *p, false);
++		  st->interface_method_table(this->gogo_, *p, true);
++		}
++	    }
+ 	}
+     }
+   return TRAVERSE_CONTINUE;
+@@ -2989,9 +3069,10 @@
+ Function::Function(Function_type* type, Function* enclosing, Block* block,
+ 		   Location location)
+   : type_(type), enclosing_(enclosing), results_(NULL),
+-    closure_var_(NULL), block_(block), location_(location), fndecl_(NULL),
+-    defer_stack_(NULL), results_are_named_(false), calls_recover_(false),
+-    is_recover_thunk_(false), has_recover_thunk_(false)
++    closure_var_(NULL), block_(block), location_(location), labels_(),
++    local_type_count_(0), fndecl_(NULL), defer_stack_(NULL),
++    results_are_named_(false), calls_recover_(false), is_recover_thunk_(false),
++    has_recover_thunk_(false)
+ {
+ }
+ 
+@@ -4157,7 +4238,7 @@
+ 	  else if (type->is_call_multiple_result_type())
+ 	    {
+ 	      error_at(this->location_,
+-		       "single variable set to multiple value function call");
++		       "single variable set to multiple-value function call");
+ 	      type = Type::make_error_type();
+ 	    }
+ 
+@@ -4599,9 +4680,10 @@
+   go_assert(this->classification_ == NAMED_OBJECT_TYPE_DECLARATION);
+   Type_declaration* td = this->u_.type_declaration;
+   td->define_methods(named_type);
+-  Named_object* in_function = td->in_function();
++  unsigned int index;
++  Named_object* in_function = td->in_function(&index);
+   if (in_function != NULL)
+-    named_type->set_in_function(in_function);
++    named_type->set_in_function(in_function, index);
+   delete td;
+   this->classification_ = NAMED_OBJECT_TYPE;
+   this->u_.type_value = named_type;
+--- a/src/gcc/go/gofrontend/gogo.h	(revision 191578)
++++ b/src/gcc/go/gofrontend/gogo.h	(revision 192023)
+@@ -574,7 +574,7 @@
+   // Build an interface method table for a type: a list of function
+   // pointers, one for each interface method.  This returns a decl.
+   tree
+-  interface_method_table_for_type(const Interface_type*, Named_type*,
++  interface_method_table_for_type(const Interface_type*, Type*,
+ 				  bool is_pointer);
+ 
+   // Return a tree which allocate SIZE bytes to hold values of type
+@@ -963,6 +963,11 @@
+   void
+   check_labels() const;
+ 
++  // Note that a new local type has been added.  Return its index.
++  unsigned int
++  new_local_type_index()
++  { return this->local_type_count_++; }
++
+   // Whether this function calls the predeclared recover function.
+   bool
+   calls_recover() const
+@@ -1084,6 +1089,8 @@
+   Location location_;
+   // Labels defined or referenced in the function.
+   Labels labels_;
++  // The number of local types defined in this function.
++  unsigned int local_type_count_;
+   // The function decl.
+   tree fndecl_;
+   // The defer stack variable.  A pointer to this variable is used to
+@@ -1638,8 +1645,8 @@
+ {
+  public:
+   Type_declaration(Location location)
+-    : location_(location), in_function_(NULL), methods_(),
+-      issued_warning_(false)
++    : location_(location), in_function_(NULL), in_function_index_(0),
++      methods_(), issued_warning_(false)
+   { }
+ 
+   // Return the location.
+@@ -1650,13 +1657,19 @@
+   // Return the function in which this type is declared.  This will
+   // return NULL for a type declared in global scope.
+   Named_object*
+-  in_function()
+-  { return this->in_function_; }
++  in_function(unsigned int* pindex)
++  {
++    *pindex = this->in_function_index_;
++    return this->in_function_;
++  }
+ 
+   // Set the function in which this type is declared.
+   void
+-  set_in_function(Named_object* f)
+-  { this->in_function_ = f; }
++  set_in_function(Named_object* f, unsigned int index)
++  {
++    this->in_function_ = f;
++    this->in_function_index_ = index;
++  }
+ 
+   // Add a method to this type.  This is used when methods are defined
+   // before the type.
+@@ -1689,6 +1702,8 @@
+   // If this type is declared in a function, a pointer back to the
+   // function in which it is defined.
+   Named_object* in_function_;
++  // The index of this type in IN_FUNCTION_.
++  unsigned int in_function_index_;
+   // Methods defined before the type is defined.
+   Methods methods_;
+   // True if we have issued a warning about a use of this type
+--- a/src/gcc/go/gofrontend/types.h	(revision 191578)
++++ b/src/gcc/go/gofrontend/types.h	(revision 192023)
+@@ -983,6 +983,19 @@
+   method_function(const Methods*, const std::string& name,
+ 		  bool* is_ambiguous);
+ 
++  // A mapping from interfaces to the associated interface method
++  // tables for this type.  This maps to a decl.
++  typedef Unordered_map_hash(const Interface_type*, tree, Type_hash_identical,
++			     Type_identical) Interface_method_tables;
++
++  // Return a pointer to the interface method table for TYPE for the
++  // interface INTERFACE.
++  static tree
++  interface_method_table(Gogo* gogo, Type* type,
++			 const Interface_type *interface, bool is_pointer,
++			 Interface_method_tables** method_tables,
++			 Interface_method_tables** pointer_tables);
++
+   // Return a composite literal for the type descriptor entry for a
+   // type.
+   static Expression*
+@@ -1994,7 +2007,8 @@
+  public:
+   Struct_type(Struct_field_list* fields, Location location)
+     : Type(TYPE_STRUCT),
+-      fields_(fields), location_(location), all_methods_(NULL)
++      fields_(fields), location_(location), all_methods_(NULL),
++      interface_method_tables_(NULL), pointer_interface_method_tables_(NULL)
+   { }
+ 
+   // Return the field NAME.  This only looks at local fields, not at
+@@ -2076,6 +2090,14 @@
+   Method*
+   method_function(const std::string& name, bool* is_ambiguous) const;
+ 
++  // Return a pointer to the interface method table for this type for
++  // the interface INTERFACE.  If IS_POINTER is true, set the type
++  // descriptor to a pointer to this type, otherwise set it to this
++  // type.
++  tree
++  interface_method_table(Gogo*, const Interface_type* interface,
++			 bool is_pointer);
++
+   // Traverse just the field types of a struct type.
+   int
+   traverse_field_types(Traverse* traverse)
+@@ -2156,6 +2178,13 @@
+   Location location_;
+   // If this struct is unnamed, a list of methods.
+   Methods* all_methods_;
++  // A mapping from interfaces to the associated interface method
++  // tables for this type.  Only used if this struct is unnamed.
++  Interface_method_tables* interface_method_tables_;
++  // A mapping from interfaces to the associated interface method
++  // tables for pointers to this type.  Only used if this struct is
++  // unnamed.
++  Interface_method_tables* pointer_interface_method_tables_;
+ };
+ 
+ // The type of an array.
+@@ -2623,8 +2652,8 @@
+  public:
+   Named_type(Named_object* named_object, Type* type, Location location)
+     : Type(TYPE_NAMED),
+-      named_object_(named_object), in_function_(NULL), type_(type),
+-      local_methods_(NULL), all_methods_(NULL),
++      named_object_(named_object), in_function_(NULL), in_function_index_(0),
++      type_(type), local_methods_(NULL), all_methods_(NULL),
+       interface_method_tables_(NULL), pointer_interface_method_tables_(NULL),
+       location_(location), named_btype_(NULL), dependencies_(),
+       is_visible_(true), is_error_(false), is_placeholder_(false),
+@@ -2651,13 +2680,19 @@
+   // Return the function in which this type is defined.  This will
+   // return NULL for a type defined in global scope.
+   const Named_object*
+-  in_function() const
+-  { return this->in_function_; }
++  in_function(unsigned int *pindex) const
++  {
++    *pindex = this->in_function_index_;
++    return this->in_function_;
++  }
+ 
+   // Set the function in which this type is defined.
+   void
+-  set_in_function(Named_object* f)
+-  { this->in_function_ = f; }
++  set_in_function(Named_object* f, unsigned int index)
++  {
++    this->in_function_ = f;
++    this->in_function_index_ = index;
++  }
+ 
+   // Return the name of the type.
+   const std::string&
+@@ -2855,16 +2890,13 @@
+   void
+   create_placeholder(Gogo*);
+ 
+-  // A mapping from interfaces to the associated interface method
+-  // tables for this type.  This maps to a decl.
+-  typedef Unordered_map_hash(const Interface_type*, tree, Type_hash_identical,
+-			     Type_identical) Interface_method_tables;
+-
+   // A pointer back to the Named_object for this type.
+   Named_object* named_object_;
+   // If this type is defined in a function, a pointer back to the
+   // function in which it is defined.
+   Named_object* in_function_;
++  // The index of this type in IN_FUNCTION_.
++  unsigned int in_function_index_;
+   // The actual type.
+   Type* type_;
+   // The list of methods defined for this type.  Any named type can
+--- a/src/gcc/go/gofrontend/parse.cc	(revision 191578)
++++ b/src/gcc/go/gofrontend/parse.cc	(revision 192023)
+@@ -1631,12 +1631,16 @@
+ 
+   // Note that INIT was already parsed with the old name bindings, so
+   // we don't have to worry that it will accidentally refer to the
+-  // newly declared variables.
++  // newly declared variables.  But we do have to worry about a mix of
++  // newly declared variables and old variables if the old variables
++  // appear in the initializations.
+ 
+   Expression_list::const_iterator pexpr;
+   if (init != NULL)
+     pexpr = init->begin();
+   bool any_new = false;
++  Expression_list* vars = new Expression_list();
++  Expression_list* vals = new Expression_list();
+   for (Typed_identifier_list::const_iterator p = til->begin();
+        p != til->end();
+        ++p)
+@@ -1644,7 +1648,7 @@
+       if (init != NULL)
+ 	go_assert(pexpr != init->end());
+       this->init_var(*p, type, init == NULL ? NULL : *pexpr, is_coloneq,
+-		     false, &any_new);
++		     false, &any_new, vars, vals);
+       if (init != NULL)
+ 	++pexpr;
+     }
+@@ -1652,6 +1656,7 @@
+     go_assert(pexpr == init->end());
+   if (is_coloneq && !any_new)
+     error_at(location, "variables redeclared but no variable is new");
++  this->finish_init_vars(vars, vals, location);
+ }
+ 
+ // See if we need to initialize a list of variables from a function
+@@ -1674,13 +1679,15 @@
+   Named_object* first_var = NULL;
+   unsigned int index = 0;
+   bool any_new = false;
++  Expression_list* ivars = new Expression_list();
++  Expression_list* ivals = new Expression_list();
+   for (Typed_identifier_list::const_iterator pv = vars->begin();
+        pv != vars->end();
+        ++pv, ++index)
+     {
+       Expression* init = Expression::make_call_result(call, index);
+       Named_object* no = this->init_var(*pv, type, init, is_coloneq, false,
+-					&any_new);
++					&any_new, ivars, ivals);
+ 
+       if (this->gogo_->in_global_scope() && no->is_variable())
+ 	{
+@@ -1700,6 +1707,8 @@
+   if (is_coloneq && !any_new)
+     error_at(location, "variables redeclared but no variable is new");
+ 
++  this->finish_init_vars(ivars, ivals, location);
++
+   return true;
+ }
+ 
+@@ -1725,7 +1734,7 @@
+   Typed_identifier_list::const_iterator p = vars->begin();
+   Expression* init = type == NULL ? index : NULL;
+   Named_object* val_no = this->init_var(*p, type, init, is_coloneq,
+-					type == NULL, &any_new);
++					type == NULL, &any_new, NULL, NULL);
+   if (type == NULL && any_new && val_no->is_variable())
+     val_no->var_value()->set_type_from_init_tuple();
+   Expression* val_var = Expression::make_var_reference(val_no, location);
+@@ -1735,7 +1744,7 @@
+   if (var_type == NULL)
+     var_type = Type::lookup_bool_type();
+   Named_object* no = this->init_var(*p, var_type, NULL, is_coloneq, false,
+-				    &any_new);
++				    &any_new, NULL, NULL);
+   Expression* present_var = Expression::make_var_reference(no, location);
+ 
+   if (is_coloneq && !any_new)
+@@ -1790,7 +1799,7 @@
+   Typed_identifier_list::const_iterator p = vars->begin();
+   Expression* init = type == NULL ? receive : NULL;
+   Named_object* val_no = this->init_var(*p, type, init, is_coloneq,
+-					type == NULL, &any_new);
++					type == NULL, &any_new, NULL, NULL);
+   if (type == NULL && any_new && val_no->is_variable())
+     val_no->var_value()->set_type_from_init_tuple();
+   Expression* val_var = Expression::make_var_reference(val_no, location);
+@@ -1800,7 +1809,7 @@
+   if (var_type == NULL)
+     var_type = Type::lookup_bool_type();
+   Named_object* no = this->init_var(*p, var_type, NULL, is_coloneq, false,
+-				    &any_new);
++				    &any_new, NULL, NULL);
+   Expression* received_var = Expression::make_var_reference(no, location);
+ 
+   if (is_coloneq && !any_new)
+@@ -1857,7 +1866,7 @@
+   if (var_type == NULL)
+     var_type = type_guard->type();
+   Named_object* val_no = this->init_var(*p, var_type, NULL, is_coloneq, false,
+-					&any_new);
++					&any_new, NULL, NULL);
+   Expression* val_var = Expression::make_var_reference(val_no, location);
+ 
+   ++p;
+@@ -1865,7 +1874,7 @@
+   if (var_type == NULL)
+     var_type = Type::lookup_bool_type();
+   Named_object* no = this->init_var(*p, var_type, NULL, is_coloneq, false,
+-				    &any_new);
++				    &any_new, NULL, NULL);
+   Expression* ok_var = Expression::make_var_reference(no, location);
+ 
+   Expression* texpr = type_guard->expr();
+@@ -1904,7 +1913,8 @@
+ 
+ Named_object*
+ Parse::init_var(const Typed_identifier& tid, Type* type, Expression* init,
+-		bool is_coloneq, bool type_from_init, bool* is_new)
++		bool is_coloneq, bool type_from_init, bool* is_new,
++		Expression_list* vars, Expression_list* vals)
+ {
+   Location location = tid.location();
+ 
+@@ -1946,9 +1956,9 @@
+ 	  // like v, ok := x.(int).
+ 	  if (!type_from_init && init != NULL)
+ 	    {
+-	      Expression *v = Expression::make_var_reference(no, location);
+-	      Statement *s = Statement::make_assignment(v, init, location);
+-	      this->gogo_->add_statement(s);
++	      go_assert(vars != NULL && vals != NULL);
++	      vars->push_back(Expression::make_var_reference(no, location));
++	      vals->push_back(init);
+ 	    }
+ 	  return no;
+ 	}
+@@ -1983,6 +1993,36 @@
+   return this->gogo_->add_variable(buf, var);
+ }
+ 
++// Finish the variable initialization by executing any assignments to
++// existing variables when using :=.  These must be done as a tuple
++// assignment in case of something like n, a, b := 1, b, a.
++
++void
++Parse::finish_init_vars(Expression_list* vars, Expression_list* vals,
++			Location location)
++{
++  if (vars->empty())
++    {
++      delete vars;
++      delete vals;
++    }
++  else if (vars->size() == 1)
++    {
++      go_assert(!this->gogo_->in_global_scope());
++      this->gogo_->add_statement(Statement::make_assignment(vars->front(),
++							    vals->front(),
++							    location));
++      delete vars;
++      delete vals;
++    }
++  else
++    {
++      go_assert(!this->gogo_->in_global_scope());
++      this->gogo_->add_statement(Statement::make_tuple_assignment(vars, vals,
++								  location));
++    }
++}
++
+ // SimpleVarDecl = identifier ":=" Expression .
+ 
+ // We've already seen the identifier.
+@@ -2723,7 +2763,11 @@
+ 	}
+       else
+ 	{
+-	  error_at(this->location(), "expected %<,%> or %<}%>");
++	  if (token->is_op(OPERATOR_SEMICOLON))
++	    error_at(this->location(),
++		     "need trailing comma before newline in composite literal");
++	  else
++	    error_at(this->location(), "expected %<,%> or %<}%>");
+ 
+ 	  this->gogo_->mark_locals_used();
+ 	  int depth = 0;
+@@ -3311,6 +3355,61 @@
+ 		  bool* is_type_switch)
+ {
+   const Token* token = this->peek_token();
++
++  // There is a complex parse for <- chan.  The choices are
++  // Convert x to type <- chan int:
++  //   (<- chan int)(x)         
++  // Receive from (x converted to type chan <- chan int):
++  //   (<- chan <- chan int (x))
++  // Convert x to type <- chan (<- chan int).
++  //   (<- chan <- chan int)(x)
++  if (token->is_op(OPERATOR_CHANOP))
++    {
++      Location location = token->location();
++      if (this->advance_token()->is_keyword(KEYWORD_CHAN))
++	{
++	  Expression* expr = this->primary_expr(false, may_be_composite_lit,
++						NULL);
++	  if (expr->is_error_expression())
++	    return expr;
++	  else if (!expr->is_type_expression())
++	    return Expression::make_receive(expr, location);
++	  else
++	    {
++	      if (expr->type()->is_error_type())
++		return expr;
++
++	      // We picked up "chan TYPE", but it is not a type
++	      // conversion.
++	      Channel_type* ct = expr->type()->channel_type();
++	      if (ct == NULL)
++		{
++		  // This is probably impossible.
++		  error_at(location, "expected channel type");
++		  return Expression::make_error(location);
++		}
++	      else if (ct->may_receive())
++		{
++		  // <- chan TYPE.
++		  Type* t = Type::make_channel_type(false, true,
++						    ct->element_type());
++		  return Expression::make_type(t, location);
++		}
++	      else
++		{
++		  // <- chan <- TYPE.  Because we skipped the leading
++		  // <-, we parsed this as chan <- TYPE.  With the
++		  // leading <-, we parse it as <- chan (<- TYPE).
++		  Type *t = this->reassociate_chan_direction(ct, location);
++		  return Expression::make_type(t, location);
++		}
++	    }
++	}
++
++      this->unget_token(Token::make_operator_token(OPERATOR_CHANOP, location));
++      token = this->peek_token();
++    }
++
+   if (token->is_op(OPERATOR_PLUS)
+       || token->is_op(OPERATOR_MINUS)
+       || token->is_op(OPERATOR_NOT)
+@@ -3323,14 +3422,6 @@
+       Operator op = token->op();
+       this->advance_token();
+ 
+-      if (op == OPERATOR_CHANOP
+-	  && this->peek_token()->is_keyword(KEYWORD_CHAN))
+-	{
+-	  // This is "<- chan" which must be the start of a type.
+-	  this->unget_token(Token::make_operator_token(op, location));
+-	  return Expression::make_type(this->type(), location);
+-	}
+-
+       Expression* expr = this->unary_expr(false, may_be_composite_lit, NULL);
+       if (expr->is_error_expression())
+ 	;
+@@ -3350,6 +3441,32 @@
+ 			      is_type_switch);
+ }
+ 
++// This is called for the obscure case of
++//   (<- chan <- chan int)(x)
++// In unary_expr we remove the leading <- and parse the remainder,
++// which gives us
++//   chan <- (chan int)
++// When we add the leading <- back in, we really want
++//   <- chan (<- chan int)
++// This means that we need to reassociate.
++
++Type*
++Parse::reassociate_chan_direction(Channel_type *ct, Location location)
++{
++  Channel_type* ele = ct->element_type()->channel_type();
++  if (ele == NULL)
++    {
++      error_at(location, "parse error");
++      return Type::make_error_type();
++    }
++  Type* sub = ele;
++  if (ele->may_send())
++    sub = Type::make_channel_type(false, true, ele->element_type());
++  else
++    sub = this->reassociate_chan_direction(ele, location);
++  return Type::make_channel_type(false, true, sub);
++}
++
+ // Statement =
+ //	Declaration | LabeledStmt | SimpleStmt |
+ //	GoStmt | ReturnStmt | BreakStmt | ContinueStmt | GotoStmt |
+@@ -5036,7 +5153,8 @@
+   bool any_new = false;
+ 
+   const Typed_identifier* pti = &til->front();
+-  Named_object* no = this->init_var(*pti, NULL, expr, true, true, &any_new);
++  Named_object* no = this->init_var(*pti, NULL, expr, true, true, &any_new,
++				    NULL, NULL);
+   if (any_new && no->is_variable())
+     no->var_value()->set_type_from_range_index();
+   p_range_clause->index = Expression::make_var_reference(no, location);
+@@ -5047,7 +5165,7 @@
+     {
+       pti = &til->back();
+       bool is_new = false;
+-      no = this->init_var(*pti, NULL, expr, true, true, &is_new);
++      no = this->init_var(*pti, NULL, expr, true, true, &is_new, NULL, NULL);
+       if (is_new && no->is_variable())
+ 	no->var_value()->set_type_from_range_value();
+       if (is_new)
+@@ -5337,7 +5455,8 @@
+ 
+   if (!token->is_string())
+     {
+-      error_at(this->location(), "missing import package name");
++      error_at(this->location(), "import statement not a string");
++      this->advance_token();
+       return;
+     }
+ 
+--- a/src/gcc/go/gofrontend/statements.cc	(revision 191578)
++++ b/src/gcc/go/gofrontend/statements.cc	(revision 192023)
+@@ -3313,16 +3313,10 @@
+ 	   p != this->cases_->end();
+ 	   ++p)
+ 	{
+-	  Expression* this_cond;
+-	  if (val_temp == NULL)
+-	    this_cond = *p;
+-	  else
+-	    {
+-	      Expression* ref = Expression::make_temporary_reference(val_temp,
+-								     loc);
+-	      this_cond = Expression::make_binary(OPERATOR_EQEQ, ref, *p, loc);
+-	    }
+-
++	  Expression* ref = Expression::make_temporary_reference(val_temp,
++								 loc);
++	  Expression* this_cond = Expression::make_binary(OPERATOR_EQEQ, ref,
++							  *p, loc);
+ 	  if (cond == NULL)
+ 	    cond = this_cond;
+ 	  else
+@@ -3846,6 +3840,16 @@
+     return new Constant_switch_statement(this->val_, this->clauses_,
+ 					 this->break_label_, loc);
+ 
++  if (this->val_ != NULL
++      && !this->val_->type()->is_comparable()
++      && !Type::are_compatible_for_comparison(true, this->val_->type(),
++					      Type::make_nil_type(), NULL))
++    {
++      error_at(this->val_->location(),
++	       "cannot switch on value whose type that may not be compared");
++      return Statement::make_error_statement(loc);
++    }
++
+   Block* b = new Block(enclosing, loc);
+ 
+   if (this->clauses_->empty())
+@@ -3856,15 +3860,12 @@
+       return Statement::make_statement(val, true);
+     }
+ 
+-  Temporary_statement* val_temp;
+-  if (this->val_ == NULL)
+-    val_temp = NULL;
+-  else
+-    {
+-      // var val_temp VAL_TYPE = VAL
+-      val_temp = Statement::make_temporary(NULL, this->val_, loc);
+-      b->add_statement(val_temp);
+-    }
++  // var val_temp VAL_TYPE = VAL
++  Expression* val = this->val_;
++  if (val == NULL)
++    val = Expression::make_boolean(true, loc);
++  Temporary_statement* val_temp = Statement::make_temporary(NULL, val, loc);
++  b->add_statement(val_temp);
+ 
+   this->clauses_->lower(b, val_temp, this->break_label());
+ 
+--- a/src/gcc/go/gofrontend/gogo-tree.cc	(revision 191578)
++++ b/src/gcc/go/gofrontend/gogo-tree.cc	(revision 192023)
+@@ -1002,9 +1002,19 @@
+     }
+   if (this->is_type())
+     {
+-      const Named_object* in_function = this->type_value()->in_function();
++      unsigned int index;
++      const Named_object* in_function = this->type_value()->in_function(&index);
+       if (in_function != NULL)
+-	decl_name += '$' + Gogo::unpack_hidden_name(in_function->name());
++	{
++	  decl_name += '$' + Gogo::unpack_hidden_name(in_function->name());
++	  if (index > 0)
++	    {
++	      char buf[30];
++	      snprintf(buf, sizeof buf, "%u", index);
++	      decl_name += '$';
++	      decl_name += buf;
++	    }
++	}
+     }
+   return get_identifier_from_string(decl_name);
+ }
+@@ -2133,8 +2143,7 @@
+ 
+ tree
+ Gogo::interface_method_table_for_type(const Interface_type* interface,
+-				      Named_type* type,
+-				      bool is_pointer)
++				      Type* type, bool is_pointer)
+ {
+   const Typed_identifier_list* interface_methods = interface->methods();
+   go_assert(!interface_methods->empty());
+@@ -2163,7 +2172,9 @@
+   // interface.  If the interface has hidden methods, and the named
+   // type is defined in a different package, then the interface
+   // conversion table will be defined by that other package.
+-  if (has_hidden_methods && type->named_object()->package() != NULL)
++  if (has_hidden_methods
++      && type->named_type() != NULL
++      && type->named_type()->named_object()->package() != NULL)
+     {
+       tree array_type = build_array_type(const_ptr_type_node, NULL);
+       tree decl = build_decl(BUILTINS_LOCATION, VAR_DECL, id, array_type);
+@@ -2191,13 +2202,20 @@
+                                               Linemap::predeclared_location());
+   elt->value = fold_convert(const_ptr_type_node, tdp);
+ 
++  Named_type* nt = type->named_type();
++  Struct_type* st = type->struct_type();
++  go_assert(nt != NULL || st != NULL);
+   size_t i = 1;
+   for (Typed_identifier_list::const_iterator p = interface_methods->begin();
+        p != interface_methods->end();
+        ++p, ++i)
+     {
+       bool is_ambiguous;
+-      Method* m = type->method_function(p->name(), &is_ambiguous);
++      Method* m;
++      if (nt != NULL)
++	m = nt->method_function(p->name(), &is_ambiguous);
++      else
++	m = st->method_function(p->name(), &is_ambiguous);
+       go_assert(m != NULL);
+ 
+       Named_object* no = m->named_object();
+--- a/src/gcc/go/gofrontend/lex.cc	(revision 191578)
++++ b/src/gcc/go/gofrontend/lex.cc	(revision 192023)
+@@ -722,7 +722,16 @@
+ 		unsigned int ci;
+ 		bool issued_error;
+ 		this->lineoff_ = p - this->linebuf_;
+-		this->advance_one_utf8_char(p, &ci, &issued_error);
++		const char *pnext = this->advance_one_utf8_char(p, &ci,
++								&issued_error);
++
++		// Ignore byte order mark at start of file.
++		if (ci == 0xfeff)
++		  {
++		    p = pnext;
++		    break;
++		  }
++
+ 		if (Lex::is_unicode_letter(ci))
+ 		  return this->gather_identifier();
+ 
+@@ -831,6 +840,14 @@
+       *issued_error = true;
+       return p + 1;
+     }
++
++  // Warn about byte order mark, except at start of file.
++  if (*value == 0xfeff && (this->lineno_ != 1 || this->lineoff_ != 0))
++    {
++      error_at(this->location(), "Unicode (UTF-8) BOM in middle of file");
++      *issued_error = true;
++    }
++
+   return p + adv;
+ }
+ 
+@@ -1295,6 +1312,12 @@
+ 	  // Turn it into the "replacement character".
+ 	  v = 0xfffd;
+ 	}
++      if (v >= 0xd800 && v < 0xe000)
++	{
++	  warning_at(location, 0,
++		     "unicode code point 0x%x is invalid surrogate pair", v);
++	  v = 0xfffd;
++	}
+       if (v <= 0xffff)
+ 	{
+ 	  buf[0] = 0xe0 + (v >> 12);
+@@ -1705,6 +1728,27 @@
+   unsigned int stride;
+ };
+ 
++// A table of whitespace characters--Unicode code points classified as
++// "Space", "C" locale whitespace characters, the "next line" control
++// character (0085), the line separator (2028), the paragraph
++// separator (2029), and the "zero-width non-break space" (feff).
++
++static const Unicode_range unicode_space[] =
++{
++  { 0x0009, 0x000d, 1 },
++  { 0x0020, 0x0020, 1 },
++  { 0x0085, 0x0085, 1 },
++  { 0x00a0, 0x00a0, 1 },
++  { 0x1680, 0x1680, 1 },
++  { 0x180e, 0x180e, 1 },
++  { 0x2000, 0x200a, 1 },
++  { 0x2028, 0x2029, 1 },
++  { 0x202f, 0x202f, 1 },
++  { 0x205f, 0x205f, 1 },
++  { 0x3000, 0x3000, 1 },
++  { 0xfeff, 0xfeff, 1 },
++};
++
+ // A table of Unicode digits--Unicode code points classified as
+ // "Digit".
+ 
+@@ -2294,6 +2338,15 @@
+     }
+ }
+ 
++// Return whether C is a space character.
++
++bool
++Lex::is_unicode_space(unsigned int c)
++{
++  return Lex::is_in_unicode_range(c, unicode_space,
++				  ARRAY_SIZE(unicode_space));
++}
++
+ // Return whether C is a Unicode digit--a Unicode code point
+ // classified as "Digit".
+ 
+--- a/src/gcc/go/gofrontend/types.cc	(revision 191578)
++++ b/src/gcc/go/gofrontend/types.cc	(revision 192023)
+@@ -430,7 +430,7 @@
+ 
+     case TYPE_CALL_MULTIPLE_RESULT:
+       if (reason != NULL)
+-	*reason = "invalid use of multiple value function call";
++	*reason = "invalid use of multiple-value function call";
+       return false;
+ 
+     default:
+@@ -588,6 +588,9 @@
+ 	       p != fields->end();
+ 	       ++p)
+ 	    {
++	      if (Gogo::is_sink_name(p->field_name()))
++		continue;
++
+ 	      if (!p->type()->is_comparable())
+ 		{
+ 		  if (reason != NULL)
+@@ -633,8 +636,8 @@
+       if (rhs->is_call_multiple_result_type())
+ 	{
+ 	  if (reason != NULL)
+-	    reason->assign(_("multiple value function call in "
+-			     "single value context"));
++	    reason->assign(_("multiple-value function call in "
++			     "single-value context"));
+ 	  return false;
+ 	}
+     }
+@@ -1295,7 +1298,8 @@
+     return "__go_td_" + this->mangled_name(gogo);
+ 
+   Named_object* no = nt->named_object();
+-  const Named_object* in_function = nt->in_function();
++  unsigned int index;
++  const Named_object* in_function = nt->in_function(&index);
+   std::string ret = "__go_tdn_";
+   if (nt->is_builtin())
+     go_assert(in_function == NULL);
+@@ -1310,6 +1314,13 @@
+ 	{
+ 	  ret.append(Gogo::unpack_hidden_name(in_function->name()));
+ 	  ret.append(1, '.');
++	  if (index > 0)
++	    {
++	      char buf[30];
++	      snprintf(buf, sizeof buf, "%u", index);
++	      ret.append(buf);
++	      ret.append(1, '.');
++	    }
+ 	}
+     }
+ 
+@@ -1746,9 +1757,19 @@
+     {
+       // This name is already hidden or not as appropriate.
+       base_name = name->name();
+-      const Named_object* in_function = name->in_function();
++      unsigned int index;
++      const Named_object* in_function = name->in_function(&index);
+       if (in_function != NULL)
+-	base_name += '$' + Gogo::unpack_hidden_name(in_function->name());
++	{
++	  base_name += '$' + Gogo::unpack_hidden_name(in_function->name());
++	  if (index > 0)
++	    {
++	      char buf[30];
++	      snprintf(buf, sizeof buf, "%u", index);
++	      base_name += '$';
++	      base_name += buf;
++	    }
++	}
+     }
+   std::string hash_name = base_name + "$hash";
+   std::string equal_name = base_name + "$equal";
+@@ -1989,10 +2010,19 @@
+ 				     ? gogo->pkgpath()
+ 				     : package->pkgpath());
+ 	  n.assign(pkgpath);
+-	  if (name->in_function() != NULL)
++	  unsigned int index;
++	  const Named_object* in_function = name->in_function(&index);
++	  if (in_function != NULL)
+ 	    {
+ 	      n.append(1, '.');
+-	      n.append(Gogo::unpack_hidden_name(name->in_function()->name()));
++	      n.append(Gogo::unpack_hidden_name(in_function->name()));
++	      if (index > 0)
++		{
++		  char buf[30];
++		  snprintf(buf, sizeof buf, "%u", index);
++		  n.append(1, '.');
++		  n.append(buf);
++		}
+ 	    }
+ 	  s = Expression::make_string(n, bloc);
+ 	  vals->push_back(Expression::make_unary(OPERATOR_AND, s, bloc));
+@@ -4276,6 +4306,9 @@
+        pf != fields->end();
+        ++pf)
+     {
++      if (Gogo::is_sink_name(pf->field_name()))
++	return false;
++
+       if (!pf->type()->compare_is_identity(gogo))
+ 	return false;
+ 
+@@ -4530,6 +4563,20 @@
+   return Type::method_function(this->all_methods_, name, is_ambiguous);
+ }
+ 
++// Return a pointer to the interface method table for this type for
++// the interface INTERFACE.  IS_POINTER is true if this is for a
++// pointer to THIS.
++
++tree
++Struct_type::interface_method_table(Gogo* gogo,
++				    const Interface_type* interface,
++				    bool is_pointer)
++{
++  return Type::interface_method_table(gogo, this, interface, is_pointer,
++				      &this->interface_method_tables_,
++				      &this->pointer_interface_method_tables_);
++}
++
+ // Convert struct fields to the backend representation.  This is not
+ // declared in types.h so that types.h doesn't have to #include
+ // backend.h.
+@@ -4749,6 +4796,9 @@
+        pf != fields->end();
+        ++pf)
+     {
++      if (Gogo::is_sink_name(pf->field_name()))
++	continue;
++
+       if (first)
+ 	first = false;
+       else
+@@ -4840,6 +4890,9 @@
+        pf != fields->end();
+        ++pf, ++field_index)
+     {
++      if (Gogo::is_sink_name(pf->field_name()))
++	continue;
++
+       // Compare one field in both P1 and P2.
+       Expression* f1 = Expression::make_temporary_reference(p1, bloc);
+       f1 = Expression::make_unary(OPERATOR_MULT, f1, bloc);
+@@ -4875,14 +4928,15 @@
+ void
+ Struct_type::do_reflection(Gogo* gogo, std::string* ret) const
+ {
+-  ret->append("struct { ");
++  ret->append("struct {");
+ 
+   for (Struct_field_list::const_iterator p = this->fields_->begin();
+        p != this->fields_->end();
+        ++p)
+     {
+       if (p != this->fields_->begin())
+-	ret->append("; ");
++	ret->push_back(';');
++      ret->push_back(' ');
+       if (p->is_anonymous())
+ 	ret->push_back('?');
+       else
+@@ -4915,7 +4969,10 @@
+ 	}
+     }
+ 
+-  ret->append(" }");
++  if (!this->fields_->empty())
++    ret->push_back(' ');
++
++  ret->push_back('}');
+ }
+ 
+ // Mangled name.
+@@ -6815,7 +6872,8 @@
+ 	      std::string n = Gogo::message_name(p->name());
+ 	      size_t len = 100 + n.length();
+ 	      char* buf = new char[len];
+-	      snprintf(buf, len, _("method %s%s%s requires a pointer"),
++	      snprintf(buf, len,
++		       _("method %s%s%s requires a pointer receiver"),
+ 		       open_quote, n.c_str(), close_quote);
+ 	      reason->assign(buf);
+ 	      delete[] buf;
+@@ -7151,7 +7209,17 @@
+ 	{
+ 	  if (!p->name().empty())
+ 	    {
+-	      std::string n = Gogo::unpack_hidden_name(p->name());
++	      std::string n;
++	      if (!Gogo::is_hidden_name(p->name()))
++		n = p->name();
++	      else
++		{
++		  n = ".";
++		  std::string pkgpath = Gogo::hidden_name_pkgpath(p->name());
++		  n.append(Gogo::pkgpath_for_symbol(pkgpath));
++		  n.append(1, '.');
++		  n.append(Gogo::unpack_hidden_name(p->name()));
++		}
+ 	      char buf[20];
+ 	      snprintf(buf, sizeof buf, "%u_",
+ 		       static_cast<unsigned int>(n.length()));
+@@ -7704,32 +7772,9 @@
+ Named_type::interface_method_table(Gogo* gogo, const Interface_type* interface,
+ 				   bool is_pointer)
+ {
+-  go_assert(!interface->is_empty());
+-
+-  Interface_method_tables** pimt = (is_pointer
+-				    ? &this->interface_method_tables_
+-				    : &this->pointer_interface_method_tables_);
+-
+-  if (*pimt == NULL)
+-    *pimt = new Interface_method_tables(5);
+-
+-  std::pair<const Interface_type*, tree> val(interface, NULL_TREE);
+-  std::pair<Interface_method_tables::iterator, bool> ins = (*pimt)->insert(val);
+-
+-  if (ins.second)
+-    {
+-      // This is a new entry in the hash table.
+-      go_assert(ins.first->second == NULL_TREE);
+-      ins.first->second = gogo->interface_method_table_for_type(interface,
+-								this,
+-								is_pointer);
+-    }
+-
+-  tree decl = ins.first->second;
+-  if (decl == error_mark_node)
+-    return error_mark_node;
+-  go_assert(decl != NULL_TREE && TREE_CODE(decl) == VAR_DECL);
+-  return build_fold_addr_expr(decl);
++  return Type::interface_method_table(gogo, this, interface, is_pointer,
++				      &this->interface_method_tables_,
++				      &this->pointer_interface_method_tables_);
+ }
+ 
+ // Return whether a named type has any hidden fields.
+@@ -8358,8 +8403,17 @@
+     }
+   if (this->in_function_ != NULL)
+     {
++      ret->push_back('\t');
+       ret->append(Gogo::unpack_hidden_name(this->in_function_->name()));
+       ret->push_back('$');
++      if (this->in_function_index_ > 0)
++	{
++	  char buf[30];
++	  snprintf(buf, sizeof buf, "%u", this->in_function_index_);
++	  ret->append(buf);
++	  ret->push_back('$');
++	}
++      ret->push_back('\t');
+     }
+   ret->append(Gogo::unpack_hidden_name(this->named_object_->name()));
+ }
+@@ -8389,6 +8443,13 @@
+ 	{
+ 	  name.append(Gogo::unpack_hidden_name(this->in_function_->name()));
+ 	  name.append(1, '$');
++	  if (this->in_function_index_ > 0)
++	    {
++	      char buf[30];
++	      snprintf(buf, sizeof buf, "%u", this->in_function_index_);
++	      name.append(buf);
++	      name.append(1, '$');
++	    }
+ 	}
+     }
+   name.append(Gogo::unpack_hidden_name(no->name()));
+@@ -8899,6 +8960,42 @@
+   return m;
+ }
+ 
++// Return a pointer to the interface method table for TYPE for the
++// interface INTERFACE.
++
++tree
++Type::interface_method_table(Gogo* gogo, Type* type,
++			     const Interface_type *interface,
++			     bool is_pointer,
++			     Interface_method_tables** method_tables,
++			     Interface_method_tables** pointer_tables)
++{
++  go_assert(!interface->is_empty());
++
++  Interface_method_tables** pimt = is_pointer ? method_tables : pointer_tables;
++
++  if (*pimt == NULL)
++    *pimt = new Interface_method_tables(5);
++
++  std::pair<const Interface_type*, tree> val(interface, NULL_TREE);
++  std::pair<Interface_method_tables::iterator, bool> ins = (*pimt)->insert(val);
++
++  if (ins.second)
++    {
++      // This is a new entry in the hash table.
++      go_assert(ins.first->second == NULL_TREE);
++      ins.first->second = gogo->interface_method_table_for_type(interface,
++								type,
++								is_pointer);
++    }
++
++  tree decl = ins.first->second;
++  if (decl == error_mark_node)
++    return error_mark_node;
++  go_assert(decl != NULL_TREE && TREE_CODE(decl) == VAR_DECL);
++  return build_fold_addr_expr(decl);
++}
++
+ // Look for field or method NAME for TYPE.  Return an Expression for
+ // the field or method bound to EXPR.  If there is no such field or
+ // method, give an appropriate error and return an error expression.
+@@ -8990,7 +9087,7 @@
+ 		 Gogo::message_name(name).c_str(), ambig1.c_str(),
+ 		 ambig2.c_str());
+       else if (found_pointer_method)
+-	error_at(location, "method requires a pointer");
++	error_at(location, "method requires a pointer receiver");
+       else if (nt == NULL && st == NULL && it == NULL)
+ 	error_at(location,
+ 		 ("reference to field %qs in object which "
+--- a/src/gcc/go/gofrontend/parse.h	(revision 191578)
++++ b/src/gcc/go/gofrontend/parse.h	(revision 192023)
+@@ -14,6 +14,7 @@
+ class Type;
+ class Typed_identifier;
+ class Typed_identifier_list;
++class Channel_type;
+ class Function_type;
+ class Block;
+ class Expression;
+@@ -205,8 +206,11 @@
+ 				 Expression*, bool is_coloneq,
+ 				 Location);
+   Named_object* init_var(const Typed_identifier&, Type*, Expression*,
+-			 bool is_coloneq, bool type_from_init, bool* is_new);
++			 bool is_coloneq, bool type_from_init, bool* is_new,
++			 Expression_list* vars, Expression_list* vals);
+   Named_object* create_dummy_global(Type*, Expression*, Location);
++  void finish_init_vars(Expression_list* vars, Expression_list* vals,
++			Location);
+   void simple_var_decl_or_assignment(const std::string&, Location,
+ 				     bool may_be_composite_lit,
+ 				     Range_clause*, Type_switch*);
+@@ -229,6 +233,7 @@
+   bool expression_may_start_here();
+   Expression* unary_expr(bool may_be_sink, bool may_be_composite_lit,
+ 			 bool* is_type_switch);
++  Type* reassociate_chan_direction(Channel_type*, Location);
+   Expression* qualified_expr(Expression*, Location);
+   Expression* id_to_expression(const std::string&, Location);
+   void statement(Label*);
+--- a/src/gcc/go/gofrontend/expressions.cc	(revision 191578)
++++ b/src/gcc/go/gofrontend/expressions.cc	(revision 192023)
+@@ -301,19 +301,25 @@
+       // object type: a list of function pointers for each interface
+       // method.
+       Named_type* rhs_named_type = rhs_type->named_type();
++      Struct_type* rhs_struct_type = rhs_type->struct_type();
+       bool is_pointer = false;
+-      if (rhs_named_type == NULL)
++      if (rhs_named_type == NULL && rhs_struct_type == NULL)
+ 	{
+ 	  rhs_named_type = rhs_type->deref()->named_type();
++	  rhs_struct_type = rhs_type->deref()->struct_type();
+ 	  is_pointer = true;
+ 	}
+       tree method_table;
+-      if (rhs_named_type == NULL)
+-	method_table = null_pointer_node;
+-      else
++      if (rhs_named_type != NULL)
+ 	method_table =
+ 	  rhs_named_type->interface_method_table(gogo, lhs_interface_type,
+ 						 is_pointer);
++      else if (rhs_struct_type != NULL)
++	method_table =
++	  rhs_struct_type->interface_method_table(gogo, lhs_interface_type,
++						  is_pointer);
++      else
++	method_table = null_pointer_node;
+       first_field_value = fold_convert_loc(location.gcc_location(),
+                                            const_ptr_type_node, method_table);
+     }
+@@ -5184,6 +5190,9 @@
+        pf != fields->end();
+        ++pf, ++field_index)
+     {
++      if (Gogo::is_sink_name(pf->field_name()))
++	continue;
++
+       if (field_index > 0)
+ 	{
+ 	  if (left_temp == NULL)
+@@ -5450,7 +5459,8 @@
+ 	  && (this->left_->type()->integer_type() == NULL
+ 	      || (subcontext.type->integer_type() == NULL
+ 		  && subcontext.type->float_type() == NULL
+-		  && subcontext.type->complex_type() == NULL)))
++		  && subcontext.type->complex_type() == NULL
++		  && subcontext.type->interface_type() == NULL)))
+ 	this->report_error(("invalid context-determined non-integer type "
+ 			    "for shift operand"));
+ 
+@@ -6682,38 +6692,6 @@
+   this->set_args(new_args);
+ }
+ 
+-// A traversal class which looks for a call expression.
+-
+-class Find_call_expression : public Traverse
+-{
+- public:
+-  Find_call_expression()
+-    : Traverse(traverse_expressions),
+-      found_(false)
+-  { }
+-
+-  int
+-  expression(Expression**);
+-
+-  bool
+-  found()
+-  { return this->found_; }
+-
+- private:
+-  bool found_;
+-};
+-
+-int
+-Find_call_expression::expression(Expression** pexpr)
+-{
+-  if ((*pexpr)->call_expression() != NULL)
+-    {
+-      this->found_ = true;
+-      return TRAVERSE_EXIT;
+-    }
+-  return TRAVERSE_CONTINUE;
+-}
+-
+ // Lower a builtin call expression.  This turns new and make into
+ // specific expressions.  We also convert to a constant if we can.
+ 
+@@ -6734,20 +6712,6 @@
+ 
+   if (this->is_constant())
+     {
+-      // We can only lower len and cap if there are no function calls
+-      // in the arguments.  Otherwise we have to make the call.
+-      if (this->code_ == BUILTIN_LEN || this->code_ == BUILTIN_CAP)
+-	{
+-	  Expression* arg = this->one_arg();
+-	  if (arg != NULL && !arg->is_constant())
+-	    {
+-	      Find_call_expression find_call;
+-	      Expression::traverse(&arg, &find_call);
+-	      if (find_call.found())
+-		return this;
+-	    }
+-	}
+-
+       Numeric_constant nc;
+       if (this->numeric_constant_value(&nc))
+ 	return nc.expression(loc);
+@@ -7064,9 +7028,43 @@
+   return args->front();
+ }
+ 
+-// Return whether this is constant: len of a string, or len or cap of
+-// a fixed array, or unsafe.Sizeof, unsafe.Offsetof, unsafe.Alignof.
++// A traversal class which looks for a call or receive expression.
+ 
++class Find_call_expression : public Traverse
++{
++ public:
++  Find_call_expression()
++    : Traverse(traverse_expressions),
++      found_(false)
++  { }
++
++  int
++  expression(Expression**);
++
++  bool
++  found()
++  { return this->found_; }
++
++ private:
++  bool found_;
++};
++
++int
++Find_call_expression::expression(Expression** pexpr)
++{
++  if ((*pexpr)->call_expression() != NULL
++      || (*pexpr)->receive_expression() != NULL)
++    {
++      this->found_ = true;
++      return TRAVERSE_EXIT;
++    }
++  return TRAVERSE_CONTINUE;
++}
++
++// Return whether this is constant: len of a string constant, or len
++// or cap of an array, or unsafe.Sizeof, unsafe.Offsetof,
++// unsafe.Alignof.
++
+ bool
+ Builtin_call_expression::do_is_constant() const
+ {
+@@ -7088,6 +7086,17 @@
+ 	    && !arg_type->points_to()->is_slice_type())
+ 	  arg_type = arg_type->points_to();
+ 
++	// The len and cap functions are only constant if there are no
++	// function calls or channel operations in the arguments.
++	// Otherwise we have to make the call.
++	if (!arg->is_constant())
++	  {
++	    Find_call_expression find_call;
++	    Expression::traverse(&arg, &find_call);
++	    if (find_call.found())
++	      return false;
++	  }
++
+ 	if (arg_type->array_type() != NULL
+ 	    && arg_type->array_type()->length() != NULL)
+ 	  return true;
+@@ -7474,7 +7483,7 @@
+ 	if (args != NULL && args->size() == 2)
+ 	  {
+ 	    Type* t1 = args->front()->type();
+-	    Type* t2 = args->front()->type();
++	    Type* t2 = args->back()->type();
+ 	    if (!t1->is_abstract())
+ 	      arg_type = t1;
+ 	    else if (!t2->is_abstract())
+--- a/src/gcc/go/gofrontend/lex.h	(revision 191578)
++++ b/src/gcc/go/gofrontend/lex.h	(revision 192023)
+@@ -375,6 +375,10 @@
+   static int
+   fetch_char(const char* str, unsigned int *value);
+ 
++  // Return whether C is a Unicode or "C" locale space character.
++  static bool
++  is_unicode_space(unsigned int c);
++
+  private:
+   ssize_t
+   get_line();

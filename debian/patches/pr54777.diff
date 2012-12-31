@@ -1,0 +1,50 @@
+# DP: Fix PR c++/54777 (c++11, rejects valid)
+
+gcc/cp/
+
+2012-10-03  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c++/54777
+	* semantics.c (cxx_eval_constant_expression) <case COMPOUND_EXPR>: If
+	not ignoring the second operand, pass the original second operand
+	and not one with stripped nops to cxx_eval_constant_expression.
+
+gcc/testsuite/
+
+2012-10-03  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c++/54777
+	* g++.dg/cpp0x/constexpr-ref4.C: New test.
+
+ 
+--- a/src/gcc/testsuite/g++.dg/cpp0x/constexpr-ref4.C	(revision 0)
++++ b/src/gcc/testsuite/g++.dg/cpp0x/constexpr-ref4.C	(revision 192037)
+@@ -0,0 +1,18 @@
++// PR c++/54777
++// { dg-options -std=c++0x }
++
++struct S
++{
++  int s[1];
++  constexpr const int &foo (unsigned i) { return (i < 1 ? 0 : throw 1), s[i]; }
++  constexpr const int &bar (unsigned i) { return i < 1 ? s[i] : (throw 0, s[i]); }
++};
++
++int
++main ()
++{
++  constexpr S a {};
++  constexpr int i = a.foo (0);
++  constexpr int j = a.bar (0);
++  static_assert (i == j, "Ouch");
++}
+--- a/src/gcc/cp/semantics.c	(revision 192036)
++++ b/src/gcc/cp/semantics.c	(revision 192037)
+@@ -7682,6 +7682,7 @@
+ 	    /* Check that the LHS is constant and then discard it.  */
+ 	    cxx_eval_constant_expression (call, op0, allow_non_constant,
+ 					  false, non_constant_p);
++	    op1 = TREE_OPERAND (t, 1);
+ 	    r = cxx_eval_constant_expression (call, op1, allow_non_constant,
+ 					      addr, non_constant_p);
+ 	  }
